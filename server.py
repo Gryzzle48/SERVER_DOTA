@@ -13,7 +13,8 @@ class SyncServer:
         self.client_sessions = {}
         self.lock = threading.Lock()
         self.running = True
-        self.session_timeout = 30  # Уменьшено до 30 секунд!
+        self.session_timeout = 300  # 5 минут
+        self.connection_timeout = 120  # 2 минуты
         self.match_events = {}
         self.pending_matches = queue.Queue()
         
@@ -23,16 +24,19 @@ class SyncServer:
         session_id = None
         
         try:
+            # Установим таймаут для чтения
+            conn.settimeout(self.connection_timeout)
+            
             while self.running:
                 try:
-                    # Устанавливаем таймаут для чтения
-                    conn.settimeout(5.0)
                     data = conn.recv(1024).decode()
                     if not data:
-                        print(f"[Сервер] Клиент {addr} отключился (пустые данные)")
-                        break
+                        print(f"[Сервер] Клиент {addr} отправил пустые данные, но соединение остается открытым")
+                        continue  # Не разрываем соединение!
+                        
                 except socket.timeout:
-                    continue  # Пропускаем таймауты
+                    # Просто продолжаем ждать данные
+                    continue
                 except ConnectionResetError:
                     print(f"[Сервер] Клиент {addr} принудительно разорвал соединение")
                     break
@@ -42,14 +46,20 @@ class SyncServer:
                     
                 parts = data.split(':')
                 if len(parts) < 2:
+                    print(f"[Сервер] Некорректный формат данных от {addr}: {data}")
                     continue
                     
                 command = parts[0]
                 session_id = parts[1]
                 
                 with self.lock:
+                    # Обновляем время активности при любой команде
+                    if client_id and session_id in self.sessions and client_id in self.sessions[session_id]:
+                        self.sessions[session_id][client_id]['last_active'] = time.time()
+                    
                     if command == "REGISTER":
                         if len(parts) < 3:
+                            print(f"[Сервер] Некорректная команда REGISTER от {addr}")
                             continue
                         client_id = parts[2]
                         
@@ -62,7 +72,8 @@ class SyncServer:
                         self.sessions[session_id][client_id] = {
                             'ready': False, 
                             'last_active': time.time(),
-                            'match_found': False
+                            'match_found': False,
+                            'address': addr
                         }
                         self.connections[client_id] = conn
                         self.client_sessions[client_id] = session_id
@@ -116,6 +127,13 @@ class SyncServer:
                         
                         # Добавляем в очередь для обработки
                         self.pending_matches.put((session_id, client_id))
+                    
+                    elif command == "PING":
+                        # Обработка ping-сообщений для поддержания соединения
+                        if client_id and session_id in self.sessions and client_id in self.sessions[session_id]:
+                            self.sessions[session_id][client_id]['last_active'] = time.time()
+                            conn.sendall(b"PONG")
+                            print(f"[Сервер] Получен PING от {client_id}, отправлен PONG")
         
         except Exception as e:
             print(f"[Сервер] Ошибка обработки клиента {addr}: {e}")
@@ -123,7 +141,11 @@ class SyncServer:
             with self.lock:
                 if client_id:
                     if client_id in self.connections:
-                        del self.connections[client_id]
+                        try:
+                            # Не закрываем соединение сразу
+                            del self.connections[client_id]
+                        except:
+                            pass
                     
                     if client_id in self.client_sessions:
                         session_id = self.client_sessions[client_id]
@@ -203,7 +225,7 @@ class SyncServer:
     def clean_inactive_sessions(self):
         """Очищает неактивные сессии и соединения"""
         while self.running:
-            time.sleep(10)  # Проверяем каждые 10 секунд!
+            time.sleep(30)  # Проверяем каждые 30 секунд
             with self.lock:
                 now = time.time()
                 inactive_clients = []

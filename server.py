@@ -13,7 +13,7 @@ class SyncServer:
         self.client_sessions = {}
         self.lock = threading.Lock()
         self.running = True
-        self.session_timeout = 600
+        self.session_timeout = 30  # Уменьшено до 30 секунд!
         self.match_events = {}
         self.pending_matches = queue.Queue()
         
@@ -24,8 +24,20 @@ class SyncServer:
         
         try:
             while self.running:
-                data = conn.recv(1024).decode()
-                if not data:
+                try:
+                    # Устанавливаем таймаут для чтения
+                    conn.settimeout(5.0)
+                    data = conn.recv(1024).decode()
+                    if not data:
+                        print(f"[Сервер] Клиент {addr} отключился (пустые данные)")
+                        break
+                except socket.timeout:
+                    continue  # Пропускаем таймауты
+                except ConnectionResetError:
+                    print(f"[Сервер] Клиент {addr} принудительно разорвал соединение")
+                    break
+                except Exception as e:
+                    print(f"[Сервер] Ошибка чтения от клиента: {e}")
                     break
                     
                 parts = data.split(':')
@@ -41,7 +53,7 @@ class SyncServer:
                             continue
                         client_id = parts[2]
                         
-                        # Очистка предыдущей регистрации
+                        # Обновляем существующую регистрацию
                         if client_id in self.client_sessions:
                             old_session = self.client_sessions[client_id]
                             if client_id in self.sessions[old_session]:
@@ -76,9 +88,9 @@ class SyncServer:
                         total_clients = len(session)
                         ready_clients = sum(1 for c in session.values() if c['ready'])
                         
-                        # Отправляем START если есть хотя бы 2 готовых клиента
-                        if total_clients >= 2 and ready_clients >= 2:
-                            print(f"[Сервер] Минимум 2 клиента ({ready_clients}/{total_clients}) готовы! Отправляю START для сессии {session_id}")
+                        # Отправляем START если все клиенты готовы
+                        if ready_clients >= total_clients and total_clients >= 1:
+                            print(f"[Сервер] Все клиенты ({ready_clients}/{total_clients}) готовы! Отправляю START для сессии {session_id}")
                             for cid in session:
                                 if cid in self.connections and session[cid]['ready']:
                                     try:
@@ -125,7 +137,10 @@ class SyncServer:
                         
                         del self.client_sessions[client_id]
             
-            conn.close()
+            try:
+                conn.close()
+            except:
+                pass
             print(f"[Сервер] Клиент {addr} отключен")
 
     def handle_match_acceptance(self):
@@ -135,15 +150,26 @@ class SyncServer:
                 session_id, client_id = self.pending_matches.get(timeout=1)
                 
                 with self.lock:
-                    # Находим второго клиента в сессии
+                    # Проверяем активность всех клиентов в сессии
+                    active_clients = []
+                    for cid, data in self.sessions[session_id].items():
+                        # Проверяем когда клиент последний раз был активен
+                        if time.time() - data['last_active'] < self.session_timeout:
+                            active_clients.append(cid)
+                    
+                    if len(active_clients) < 2:
+                        print(f"[Сервер] В сессии {session_id} недостаточно активных клиентов")
+                        continue
+                    
+                    # Находим второго активного клиента в сессии
                     other_client = None
-                    for cid in self.sessions[session_id]:
+                    for cid in active_clients:
                         if cid != client_id:
                             other_client = cid
                             break
                     
                     if not other_client:
-                        print(f"[Сервер] В сессии {session_id} только один клиент")
+                        print(f"[Сервер] В сессии {session_id} только один активный клиент")
                         if client_id in self.connections:
                             self.connections[client_id].sendall(b"SKIP")
                         continue
@@ -175,32 +201,48 @@ class SyncServer:
                 print(f"[Сервер] Ошибка обработки матча: {e}")
 
     def clean_inactive_sessions(self):
+        """Очищает неактивные сессии и соединения"""
         while self.running:
-            time.sleep(60)
+            time.sleep(10)  # Проверяем каждые 10 секунд!
             with self.lock:
                 now = time.time()
-                to_remove = []
+                inactive_clients = []
                 
-                for session_id, session in list(self.sessions.items()):
-                    for client_id, client_data in list(session.items()):
+                # Собираем неактивных клиентов
+                for session_id, session in self.sessions.items():
+                    for client_id, client_data in session.items():
                         if now - client_data['last_active'] > self.session_timeout:
-                            print(f"[Сервер] Удаление неактивного клиента {client_id} из сессии {session_id}")
-                            
-                            if client_id in self.connections:
-                                try:
-                                    self.connections[client_id].close()
-                                except:
-                                    pass
-                                del self.connections[client_id]
-                            
-                            del session[client_id]
-                            
-                            if client_id in self.client_sessions:
-                                del self.client_sessions[client_id]
+                            inactive_clients.append((session_id, client_id))
+                
+                # Удаляем неактивных клиентов
+                for session_id, client_id in inactive_clients:
+                    print(f"[Сервер] Удаление неактивного клиента {client_id} из сессии {session_id}")
                     
+                    # Закрываем соединение
+                    if client_id in self.connections:
+                        try:
+                            self.connections[client_id].close()
+                        except:
+                            pass
+                        del self.connections[client_id]
+                    
+                    # Удаляем из сессии
+                    if session_id in self.sessions and client_id in self.sessions[session_id]:
+                        del self.sessions[session_id][client_id]
+                    
+                    # Удаляем из индекса клиентов
+                    if client_id in self.client_sessions:
+                        del self.client_sessions[client_id]
+                
+                # Удаляем пустые сессии
+                empty_sessions = []
+                for session_id, session in self.sessions.items():
                     if not session:
-                        del self.sessions[session_id]
-                        print(f"[Сервер] Сессия {session_id} удалена по таймауту")
+                        empty_sessions.append(session_id)
+                
+                for session_id in empty_sessions:
+                    del self.sessions[session_id]
+                    print(f"[Сервер] Сессия {session_id} удалена по таймауту")
 
     def start(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

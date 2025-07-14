@@ -1,8 +1,8 @@
 import socket
 import threading
 import time
+import select  # Добавляем импорт модуля select
 from collections import defaultdict
-import heapq
 
 class SyncServer:
     def __init__(self, host='0.0.0.0', port=1234, min_clients=2):
@@ -11,14 +11,13 @@ class SyncServer:
         self.sessions = defaultdict(dict)  # session_id -> {client_id: client_data}
         self.connections = {}  # client_id -> socket
         self.client_sessions = {}  # client_id -> session_id
-        self.session_states = defaultdict(dict)  # session_id -> session_state
         self.found_games = defaultdict(dict)  # session_id -> {client_id: timestamp}
-        self.pending_commands = defaultdict(dict)  # client_id -> list of commands
+        self.pending_commands = defaultdict(list)  # client_id -> list of commands
         self.lock = threading.Lock()
         self.running = True
-        self.session_timeout = 600
+        self.session_timeout = 60
         self.min_clients = min_clients
-        self.game_timeout = 5  # 5 секунд на ожидание второго клиента
+        self.game_timeout = 10  # 5 секунд на ожидание второго клиента
         self.command_retention = 30  # Хранить команды 30 секунд
 
     def handle_client(self, conn, addr):
@@ -29,9 +28,9 @@ class SyncServer:
         try:
             while self.running:
                 try:
-                    # Проверяем данные с таймаутом
-                    ready = select.select([conn], [], [], 1.0)
-                    if not ready[0]:
+                    # Проверяем данные с помощью select
+                    ready, _, _ = select.select([conn], [], [], 1.0)
+                    if not ready:
                         continue
                     
                     data = conn.recv(1024).decode()
@@ -39,7 +38,10 @@ class SyncServer:
                         break
                 except (socket.timeout, BlockingIOError):
                     continue
-                except ConnectionResetError:
+                except (ConnectionResetError, ConnectionAbortedError):
+                    break
+                except Exception as e:
+                    print(f"[Сервер] Ошибка чтения данных: {e}")
                     break
                     
                 parts = data.split(':')
@@ -76,11 +78,14 @@ class SyncServer:
                                 try:
                                     conn.sendall(cmd.encode())
                                 except:
-                                    pass
-                            del self.pending_commands[client_id]
+                                    print(f"[Сервер] Ошибка отправки ожидающей команды {cmd} клиенту {client_id}")
+                            self.pending_commands[client_id] = []
                         
                         print(f"[Сервер] Клиент {client_id} зарегистрирован в сессии {session_id}. Всего в сессии: {len(self.sessions[session_id])}")
-                        conn.sendall(b"ACK:REGISTER")
+                        try:
+                            conn.sendall(b"ACK:REGISTER")
+                        except:
+                            print(f"[Сервер] Ошибка отправки ACK:REGISTER клиенту {client_id}")
                         
                     elif command == "READY":
                         if len(parts) < 3:
@@ -96,7 +101,10 @@ class SyncServer:
                         self.sessions[session_id][client_id]['ready'] = True
                         self.sessions[session_id][client_id]['last_active'] = time.time()
                         print(f"[Сервер] Клиент {client_id} готов в сессии {session_id}")
-                        conn.sendall(b"ACK:READY")
+                        try:
+                            conn.sendall(b"ACK:READY")
+                        except:
+                            print(f"[Сервер] Ошибка отправки ACK:READY клиенту {client_id}")
                         
                         session = self.sessions[session_id]
                         total_clients = len(session)
@@ -113,8 +121,6 @@ class SyncServer:
                                         self.sessions[session_id][cid]['ready'] = False
                                     except:
                                         # Сохраняем команду для последующей отправки
-                                        if cid not in self.pending_commands:
-                                            self.pending_commands[cid] = []
                                         self.pending_commands[cid].append("START")
                                         print(f"[Сервер] Ошибка отправки START клиенту {cid}, команда сохранена")
                     
@@ -141,9 +147,15 @@ class SyncServer:
                             session = self.sessions[session_id]
                             total = len(session)
                             ready = sum(1 for c in session.values() if c['ready'])
-                            conn.sendall(f"STATUS:{total}:{ready}:{self.min_clients}".encode())
+                            try:
+                                conn.sendall(f"STATUS:{total}:{ready}:{self.min_clients}".encode())
+                            except:
+                                print(f"[Сервер] Ошибка отправки STATUS клиенту {client_id}")
                         else:
-                            conn.sendall(f"STATUS:0:0:{self.min_clients}".encode())
+                            try:
+                                conn.sendall(f"STATUS:0:0:{self.min_clients}".encode())
+                            except:
+                                print(f"[Сервер] Ошибка отправки STATUS клиенту {client_id}")
                     
                     elif command == "PING":
                         if len(parts) < 3:
@@ -151,7 +163,10 @@ class SyncServer:
                         client_id = parts[2]
                         if session_id in self.sessions and client_id in self.sessions[session_id]:
                             self.sessions[session_id][client_id]['last_active'] = time.time()
-                            conn.sendall(b"PONG")
+                            try:
+                                conn.sendall(b"PONG")
+                            except:
+                                print(f"[Сервер] Ошибка отправки PONG клиенту {client_id}")
         
         except Exception as e:
             print(f"[Сервер] Ошибка обработки клиента {addr}: {e}")
@@ -159,9 +174,8 @@ class SyncServer:
             with self.lock:
                 if client_id:
                     # Помечаем клиента как отключенного, но сохраняем данные
-                    if session_id and session_id in self.sessions:
-                        if client_id in self.sessions[session_id]:
-                            self.sessions[session_id][client_id]['connected'] = False
+                    if session_id and session_id in self.sessions and client_id in self.sessions[session_id]:
+                        self.sessions[session_id][client_id]['connected'] = False
                     
                     if client_id in self.connections:
                         del self.connections[client_id]
@@ -186,13 +200,10 @@ class SyncServer:
                         self.connections[cid].sendall(b"ACCEPT")
                     except:
                         # Сохраняем команду для последующей отправки
-                        if cid not in self.pending_commands:
-                            self.pending_commands[cid] = []
                         self.pending_commands[cid].append("ACCEPT")
+                        print(f"[Сервер] Ошибка отправки ACCEPT клиенту {cid}, команда сохранена")
                 else:
                     # Сохраняем команду для последующей отправки
-                    if cid not in self.pending_commands:
-                        self.pending_commands[cid] = []
                     self.pending_commands[cid].append("ACCEPT")
             del self.found_games[session_id]
             return
@@ -206,13 +217,10 @@ class SyncServer:
                         self.connections[client_id].sendall(b"SKIP")
                     except:
                         # Сохраняем команду для последующей отправки
-                        if client_id not in self.pending_commands:
-                            self.pending_commands[client_id] = []
                         self.pending_commands[client_id].append("SKIP")
+                        print(f"[Сервер] Ошибка отправки SKIP клиенту {client_id}, команда сохранена")
                 else:
                     # Сохраняем команду для последующей отправки
-                    if client_id not in self.pending_commands:
-                        self.pending_commands[client_id] = []
                     self.pending_commands[client_id].append("SKIP")
                 
                 # Удаляем клиента из списка ожидающих
@@ -230,12 +238,18 @@ class SyncServer:
                 now = time.time()
                 
                 # Очищаем старые команды
-                for client_id, commands in list(self.pending_commands.items()):
-                    # Удаляем команды старше retention периода
-                    self.pending_commands[client_id] = [cmd for cmd in commands 
-                                                       if now - self.get_command_timestamp(cmd) < self.command_retention]
+                for client_id in list(self.pending_commands.keys()):
+                    # Удаляем клиента, если он неактивен
+                    if client_id in self.client_sessions:
+                        session_id = self.client_sessions[client_id]
+                        if session_id in self.sessions and client_id in self.sessions[session_id]:
+                            last_active = self.sessions[session_id][client_id]['last_active']
+                            if now - last_active > self.session_timeout:
+                                del self.pending_commands[client_id]
+                                continue
                     
-                    if not self.pending_commands[client_id]:
+                    # Удаляем команды для несуществующих клиентов
+                    if client_id not in self.client_sessions:
                         del self.pending_commands[client_id]
                 
                 # Очищаем неактивные сессии
@@ -264,10 +278,6 @@ class SyncServer:
                         # Удаляем связанные данные
                         if session_id in self.found_games:
                             del self.found_games[session_id]
-    
-    def get_command_timestamp(self, command):
-        """Возвращает примерное время создания команды (для простоты используем текущее время)"""
-        return time.time()
 
     def start(self):
         """Запускает сервер"""
@@ -277,9 +287,6 @@ class SyncServer:
             s.listen(10)
             print(f"[Сервер] Сервер запущен на {self.host}:{self.port}")
             
-            # Устанавливаем неблокирующий режим
-            s.settimeout(1.0)
-            
             # Запускаем поток очистки
             threading.Thread(target=self.clean_inactive_sessions, daemon=True).start()
             
@@ -288,9 +295,7 @@ class SyncServer:
                     conn, addr = s.accept()
                     # Устанавливаем таймаут для соединения
                     conn.settimeout(10.0)
-                    threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
-                except socket.timeout:
-                    continue
+                    threading.Thread(target=self.handle_client, args=(conn, addr)).start()
                 except Exception as e:
                     if self.running:
                         print(f"[Сервер] Ошибка подключения: {e}")

@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 
 class SyncServer:
-    def __init__(self, host='0.0.0.0', port=1234, min_clients=2):  # Добавлен параметр min_clients
+    def __init__(self, host='0.0.0.0', port=1234, min_clients=2):
         self.host = host
         self.port = port
         self.sessions = defaultdict(dict)
@@ -13,7 +13,7 @@ class SyncServer:
         self.lock = threading.Lock()
         self.running = True
         self.session_timeout = 600
-        self.min_clients = min_clients  # Минимальное количество клиентов для запуска
+        self.min_clients = min_clients
 
     def handle_client(self, conn, addr):
         print(f"[Сервер] Подключен клиент: {addr}")
@@ -74,7 +74,7 @@ class SyncServer:
                         total_clients = len(session)
                         ready_clients = sum(1 for c in session.values() if c['ready'])
                         
-                        # Ключевое исправление: проверяем минимальное количество клиентов
+                        # Проверяем минимальное количество клиентов
                         if total_clients >= self.min_clients and ready_clients == total_clients:
                             print(f"[Сервер] Все клиенты ({ready_clients}/{total_clients}) готовы! Отправляю START для сессии {session_id}")
                             for cid in session:
@@ -91,7 +91,7 @@ class SyncServer:
                             session = self.sessions[session_id]
                             total = len(session)
                             ready = sum(1 for c in session.values() if c['ready'])
-                            conn.sendall(f"STATUS:{total}:{ready}:{self.min_clients}".encode())  # Добавлен min_clients
+                            conn.sendall(f"STATUS:{total}:{ready}:{self.min_clients}".encode())
                         else:
                             conn.sendall(f"STATUS:0:0:{self.min_clients}".encode())
                     
@@ -126,7 +126,6 @@ class SyncServer:
             conn.close()
             print(f"[Сервер] Клиент {addr} отключен")
 
-    # clean_inactive_sessions и start остаются без изменений
     def clean_inactive_sessions(self):
         while self.running:
             time.sleep(60)
@@ -183,7 +182,7 @@ class SyncServer:
             self.connections.clear()
 
 if __name__ == "__main__":
-    server = SyncServer(min_clients=2)  # Установка минимального количества клиентов
+    server = SyncServer(min_clients=2)
     try:
         server.start()
     except KeyboardInterrupt:

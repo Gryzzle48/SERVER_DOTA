@@ -163,7 +163,7 @@ class EnhancedSyncServer:
         if not self.sessions[session][cid]['pending_commands']:
             return
             
-        print(f"Отправка ожидающих команд для {cid} ({len(self.sessions[session][cid]['pending_commands']})")
+        print(f"Отправка ожидающих команд для {cid} ({len(self.sessions[session][cid]['pending_commands'])})")
         
         try:
             for command in self.sessions[session][cid]['pending_commands']:

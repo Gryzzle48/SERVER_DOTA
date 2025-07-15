@@ -20,8 +20,12 @@ class EnhancedSyncServer:
         
         try:
             while self.running:
-                data = conn.recv(1024).decode().strip()
-                if not data:
+                try:
+                    data = conn.recv(1024).decode().strip()
+                    if not data:
+                        break
+                except ConnectionResetError:
+                    print(f"Соединение с клиентом {addr} разорвано")
                     break
                     
                 parts = data.split(':')
@@ -31,7 +35,6 @@ class EnhancedSyncServer:
                 command, session, cid = parts[0], parts[1], parts[2]
                 
                 with self.lock:
-                    # Обработка основных команд
                     if command == "REGISTER":
                         self._handle_register(conn, session, cid)
                         client_id = cid
@@ -52,13 +55,14 @@ class EnhancedSyncServer:
                     
             # Обработка таймера игры
             if session_id and client_id:
-                self._check_game_timer(session_id)
+                self._check_game_timer(session_id)  # Исправлено: _check_game_timer вместо _check_game_time
                 
+        except Exception as e:
+            print(f"Ошибка обработки клиента: {e}")
         finally:
             self._cleanup_client(client_id, session_id, conn)
 
     def _handle_register(self, conn, session, cid):
-        """Обработка регистрации клиента"""
         if cid in self.connections:
             try:
                 self.connections[cid].close()
@@ -70,41 +74,40 @@ class EnhancedSyncServer:
             'found': False,
             'active': True,
             'last_active': time.time(),
-            'conn': conn  # Сохраняем соединение
+            'conn': conn
         }
         self.connections[cid] = conn
         conn.sendall(b"ACK:REGISTER")
         print(f"Клиент {cid} зарегистрирован в сессии {session}")
 
     def _handle_ready(self, session, cid):
-        """Обработка готовности клиента"""
         if session in self.sessions and cid in self.sessions[session]:
             self.sessions[session][cid]['ready'] = True
             self.sessions[session][cid]['last_active'] = time.time()
             
-            # Исправление: получаем соединение из данных клиента
             client_conn = self.sessions[session][cid]['conn']
-            client_conn.sendall(b"ACK:READY")
-            
+            try:
+                client_conn.sendall(b"ACK:READY")
+            except:
+                self.sessions[session][cid]['active'] = False
+                
             print(f"Клиент {cid} готов к поиску")
             
-            # Проверка возможности начала поиска
             if self._check_start_condition(session):
                 print(f"Все клиенты готовы, отправляю START для сессии {session}")
-                for client in self.sessions[session].values():
+                for client_id, client_data in self.sessions[session].items():
                     try:
-                        client['conn'].sendall(b"START")
+                        if client_data['active']:
+                            client_data['conn'].sendall(b"START")
                     except:
-                        pass
+                        self.sessions[session][client_id]['active'] = False
 
     def _handle_found(self, session, cid):
-        """Обработка найденной игры"""
         if session in self.sessions and cid in self.sessions[session]:
             self.sessions[session][cid]['found'] = True
             self.sessions[session][cid]['last_active'] = time.time()
             print(f"Клиент {cid} нашел игру")
             
-            # Запуск таймера подтверждения
             if session not in self.game_timers:
                 self.game_timers[session] = {
                     'timer': threading.Timer(5.0, self._handle_game_timeout, [session]),
@@ -112,46 +115,50 @@ class EnhancedSyncServer:
                 }
                 self.game_timers[session]['timer'].start()
                 
-            # Проверка подтверждения игры
             self.game_timers[session]['found_clients'].add(cid)
             self._check_game_confirmation(session)
 
     def _handle_reconnect(self, conn, session, cid):
-        """Обработка переподключения клиента"""
         if session in self.sessions and cid in self.sessions[session]:
             self.sessions[session][cid]['conn'] = conn
             self.connections[cid] = conn
             self.sessions[session][cid]['active'] = True
             self.sessions[session][cid]['last_active'] = time.time()
-            conn.sendall(b"ACK:RECONNECT")
+            try:
+                conn.sendall(b"ACK:RECONNECT")
+            except:
+                self.sessions[session][cid]['active'] = False
             print(f"Клиент {cid} переподключен")
             
-            # Повторная отправка текущего состояния
             if self.sessions[session][cid]['found']:
-                conn.sendall(b"FOUND")
+                try:
+                    conn.sendall(b"FOUND")
+                except:
+                    self.sessions[session][cid]['active'] = False
             elif self.sessions[session][cid]['ready']:
-                conn.sendall(b"READY")
+                try:
+                    conn.sendall(b"READY")
+                except:
+                    self.sessions[session][cid]['active'] = False
 
     def _check_game_confirmation(self, session):
-        """Проверяет подтверждение игры"""
         if session not in self.game_timers:
             return
             
         timer_data = self.game_timers[session]
         session_data = self.sessions.get(session, {})
         
-        # Все клиенты нашли игру
-        if len(timer_data['found_clients']) == len(session_data):
-            print(f"Все клиенты нашли игру, подтверждаем")
+        if len(timer_data['found_clients']) == sum(1 for c in session_data.values() if c['active']):
+            print(f"Все активные клиенты нашли игру, подтверждаем")
             for client in session_data.values():
-                try:
-                    client['conn'].sendall(b"ACCEPT")
-                except:
-                    pass
+                if client['active']:
+                    try:
+                        client['conn'].sendall(b"ACCEPT")
+                    except:
+                        client['active'] = False
             self._cleanup_game_timer(session)
 
     def _handle_game_timeout(self, session):
-        """Обработка таймаута подтверждения игры"""
         with self.lock:
             if session not in self.game_timers:
                 return
@@ -161,15 +168,15 @@ class EnhancedSyncServer:
             
             print(f"Таймаут подтверждения игры для сессии {session}")
             for cid, client in session_data.items():
-                try:
-                    client['conn'].sendall(b"SKIP")
-                except:
-                    pass
+                if client['active']:
+                    try:
+                        client['conn'].sendall(b"SKIP")
+                    except:
+                        client['active'] = False
                     
             self._cleanup_game_timer(session)
 
     def _cleanup_game_timer(self, session):
-        """Очищает таймер игры"""
         if session in self.game_timers:
             try:
                 self.game_timers[session]['timer'].cancel()
@@ -178,16 +185,22 @@ class EnhancedSyncServer:
             del self.game_timers[session]
 
     def _check_start_condition(self, session):
-        """Проверяет возможность начать поиск"""
         if session not in self.sessions:
             return False
             
         session_data = self.sessions[session]
-        ready_clients = sum(1 for c in session_data.values() if c['ready'])
-        return ready_clients >= self.min_clients and ready_clients == len(session_data)
+        active_clients = sum(1 for c in session_data.values() if c['active'])
+        ready_clients = sum(1 for c in session_data.values() if c['ready'] and c['active'])
+        return ready_clients >= self.min_clients and ready_clients == active_clients
+
+    def _check_game_timer(self, session):
+        """Проверяет и обрабатывает таймеры игры для сессии"""
+        if session in self.game_timers:
+            timer_data = self.game_timers[session]
+            if not timer_data['timer'].is_alive():
+                self._handle_game_timeout(session)
 
     def _cleanup_client(self, cid, session_id, conn):
-        """Очистка данных клиента"""
         with self.lock:
             if cid and session_id and session_id in self.sessions and cid in self.sessions[session_id]:
                 del self.sessions[session_id][cid]

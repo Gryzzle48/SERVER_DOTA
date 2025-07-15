@@ -1,331 +1,220 @@
 import socket
 import threading
 import time
+import queue
 from collections import defaultdict
 
-class EnhancedSyncServer:
-    def __init__(self, host='0.0.0.0', port=1234, min_clients=2):
-        self.host = host
-        self.port = port
-        self.sessions = defaultdict(dict)
-        self.connections = {}
-        self.lock = threading.Lock()
+# Конфигурация сервера
+SERVER_IP = '0.0.0.0'
+SERVER_PORT = 1234
+SESSION_ID = 'DOTA_BOTS'
+SYNC_TIMEOUT = 5  # 5 секунд ожидания второго клиента
+
+class ClientHandler:
+    def __init__(self, conn, addr, server):
+        self.conn = conn
+        self.addr = addr
+        self.server = server
+        self.client_id = None
+        self.session_id = None
+        self.state = "disconnected"
+        self.search_status = "idle"
+        self.command_queue = queue.Queue()
         self.running = True
-        self.min_clients = min_clients
-        self.game_timers = {}
-        # Запускаем очистку неактивных клиентов
-        self.start_inactive_cleaner()
-
-    def start_inactive_cleaner(self):
-        """Фоновая задача для очистки неактивных клиентов"""
-        def cleaner():
-            while self.running:
-                time.sleep(60)  # Проверка каждую минуту
-                with self.lock:
-                    now = time.time()
-                    for session, clients in list(self.sessions.items()):
-                        for cid, data in list(clients.items()):
-                            # Удаляем клиентов неактивных более 5 минут
-                            if not data['active'] and now - data['last_seen'] > 300:
-                                del self.sessions[session][cid]
-                                print(f"Удален неактивный клиент: {cid} из сессии {session}")
+        self.thread = threading.Thread(target=self.handle_client)
+        self.thread.daemon = True
+        self.thread.start()
         
-        threading.Thread(target=cleaner, daemon=True).start()
-
-    def handle_client(self, conn, addr):
-        client_id = None
-        session_id = None
-        
+    def handle_client(self):
         try:
             while self.running:
                 try:
-                    data = conn.recv(1024).decode().strip()
+                    data = self.conn.recv(1024).decode().strip()
                     if not data:
                         break
-                except ConnectionResetError:
-                    print(f"Соединение с клиентом {addr} разорвано")
-                    break
                     
-                parts = data.split(':')
-                if len(parts) < 3:
+                    # Обработка команд
+                    parts = data.split(':')
+                    cmd = parts[0]
+                    
+                    if cmd == "REGISTER":
+                        if len(parts) < 4:
+                            continue
+                        self.session_id = parts[1]
+                        self.client_id = parts[2]
+                        state_parts = parts[3].split(';')
+                        self.state = state_parts[0]
+                        if len(state_parts) > 1:
+                            self.search_status = state_parts[1]
+                            
+                        # Добавляем клиента в сессию
+                        self.server.add_client(self)
+                        print(f"[{self.client_id}] Зарегистрирован в сессии {self.session_id}")
+                        self.conn.sendall(b"OK\n")
+                    
+                    elif cmd == "READY":
+                        if self.session_id and self.client_id:
+                            self.state = "ready"
+                            self.server.process_ready(self)
+                            self.conn.sendall(b"ACK\n")
+                    
+                    elif cmd == "FOUND":
+                        if self.session_id and self.client_id:
+                            self.state = "found"
+                            self.search_status = "found"
+                            self.server.process_found(self)
+                            self.conn.sendall(b"ACK\n")
+                    
+                    elif cmd == "PING":
+                        self.conn.sendall(b"PONG\n")
+                    
+                    elif cmd == "RECONNECT":
+                        # Повторная регистрация
+                        if len(parts) >= 4:
+                            self.session_id = parts[1]
+                            self.client_id = parts[2]
+                            state_parts = parts[3].split(';')
+                            self.state = state_parts[0]
+                            if len(state_parts) > 1:
+                                self.search_status = state_parts[1]
+                            self.server.add_client(self)
+                            print(f"[{self.client_id}] Переподключен")
+                            self.conn.sendall(b"OK\n")
+                    
+                    else:
+                        print(f"Неизвестная команда: {data}")
+                        self.conn.sendall(b"UNKNOWN\n")
+                except socket.timeout:
                     continue
-                    
-                command, session, cid = parts[0], parts[1], parts[2]
-                state_str = parts[3] if len(parts) > 3 else ""
-                
-                with self.lock:
-                    if command == "REGISTER":
-                        self._handle_register(conn, session, cid, addr, state_str)
-                        client_id = cid
-                        session_id = session
-                        
-                    elif command == "READY":
-                        self._handle_ready(session, cid)
-                        
-                    elif command == "FOUND":
-                        self._handle_found(session, cid)
-                        
-                    elif command == "RECONNECT":
-                        state_str = parts[3] if len(parts) > 3 else ""
-                        self._handle_reconnect(conn, session, cid, addr, state_str)
-                        
-                    elif command == "PONG":
-                        if session in self.sessions and cid in self.sessions[session]:
-                            self.sessions[session][cid]['last_seen'] = time.time()
-                    
-            # Обработка таймера игры
-            if session_id and client_id:
-                self._check_game_timer(session_id)
-                
         except Exception as e:
             print(f"Ошибка обработки клиента: {e}")
         finally:
-            self._mark_inactive(client_id, session_id)
-
-    def _handle_register(self, conn, session, cid, addr, state_str=""):
-        now = time.time()
-        client_state = "idle"
-        has_command = False
-        
-        # Парсим переданное состояние
-        if state_str:
-            parts = state_str.split(':')
-            if len(parts) >= 2:
-                client_state = parts[0]
-                has_command = bool(int(parts[1]))
-        
-        # Если клиент уже существует, обновляем соединение
-        if session in self.sessions and cid in self.sessions[session]:
-            client_data = self.sessions[session][cid]
-            client_data['conn'] = conn
-            client_data['active'] = True
-            client_data['last_seen'] = now
-            client_data['state'] = client_state
-            client_data['has_command'] = has_command
-            self.connections[cid] = conn
-            print(f"Клиент {cid} перерегистрирован в сессии {session}. Состояние: {client_state}")
-        else:
-            # Новый клиент
-            self.sessions[session][cid] = {
-                'ready': False,
-                'found': False,
-                'active': True,
-                'last_seen': now,
-                'conn': conn,
-                'pending_commands': [],
-                'state': client_state,
-                'has_command': has_command
-            }
-            self.connections[cid] = conn
-            print(f"Клиент {cid} зарегистрирован в сессии {session}. Состояние: {client_state}")
-
-        # Отправляем ожидающие команды
-        self._send_pending_commands(session, cid)
-        
-        # Если клиент уже ищет игру, обновляем его состояние
-        if client_state == "searching":
-            self.sessions[session][cid]['ready'] = True
-            print(f"Клиент {cid} уже ищет игру, отмечаем как готового")
-        
-        # Если клиент уже нашел игру, обновляем его состояние
-        if client_state == "found":
-            self.sessions[session][cid]['found'] = True
-            print(f"Клиент {cid} уже нашел игру, отмечаем как найденного")
-
-    def _handle_ready(self, session, cid):
-        if session in self.sessions and cid in self.sessions[session]:
-            self.sessions[session][cid]['ready'] = True
-            self.sessions[session][cid]['last_seen'] = time.time()
-            
-            print(f"Клиент {cid} готов к поиску")
-            
-            if self._check_start_condition(session):
-                print(f"Все клиенты готовы, отправляю START для сессии {session}")
-                self._broadcast_to_session(session, "START")
-
-    def _handle_found(self, session, cid):
-        if session in self.sessions and cid in self.sessions[session]:
-            print(f"Клиент {cid} нашел игру")
-            self.sessions[session][cid]['found'] = True
-            self.sessions[session][cid]['last_seen'] = time.time()
-            
-            # Запуск/сброс таймера подтверждения
-            if session not in self.game_timers:
-                print(f"Запуск таймера подтверждения для сессии {session}")
-                self.game_timers[session] = {
-                    'timer': threading.Timer(7.0, self._handle_game_timeout, [session]),
-                    'found_clients': set()
-                }
-                self.game_timers[session]['timer'].start()
-            else:
-                # Сбрасываем таймер при новом FOUND
-                try:
-                    self.game_timers[session]['timer'].cancel()
-                except:
-                    pass
-                self.game_timers[session]['timer'] = threading.Timer(7.0, self._handle_game_timeout, [session])
-                self.game_timers[session]['timer'].start()
-                print(f"Сброс таймера для сессии {session}")
-                
-            # Проверка подтверждения игры
-            self.game_timers[session]['found_clients'].add(cid)
-            self._check_game_confirmation(session)
-
-    def _handle_reconnect(self, conn, session, cid, addr, state_str=""):
-        if session in self.sessions and cid in self.sessions[session]:
-            client_data = self.sessions[session][cid]
-            client_data['conn'] = conn
-            client_data['active'] = True
-            client_data['last_seen'] = time.time()
-            self.connections[cid] = conn
-            
-            # Обновляем состояние клиента
-            if state_str:
-                parts = state_str.split(':')
-                if len(parts) >= 2:
-                    client_data['state'] = parts[0]
-                    client_data['has_command'] = bool(int(parts[1]))
-            
-            print(f"Клиент {cid} переподключен. Состояние: {client_data['state']}")
-            
-            # Отправляем ожидающие команды
-            self._send_pending_commands(session, cid)
-
-    def _send_pending_commands(self, session, cid):
-        """Отправляет все ожидающие команды клиенту"""
-        if not self.sessions[session][cid]['pending_commands']:
-            return
-            
-        print(f"Отправка ожидающих команд для {cid} ({len(self.sessions[session][cid]['pending_commands'])})")
-        
+            self.running = False
+            self.server.remove_client(self)
+            self.conn.close()
+    
+    def send_command(self, command):
         try:
-            for command in self.sessions[session][cid]['pending_commands']:
-                self.sessions[session][cid]['conn'].sendall(command.encode())
-                print(f"Отправлена ожидающая команда: {command} для {cid}")
-        except Exception as e:
-            print(f"Ошибка отправки ожидающих команд для {cid}: {e}")
-        
-        # Очищаем очередь команд
-        self.sessions[session][cid]['pending_commands'] = []
-
-    def _check_game_confirmation(self, session):
-        """Проверяет подтверждение игры"""
-        if session not in self.game_timers:
-            return
-            
-        timer_data = self.game_timers[session]
-        session_data = self.sessions.get(session, {})
-        
-        # Все активные клиенты нашли игру
-        active_clients = [cid for cid, client in session_data.items() if client['active']]
-        if len(timer_data['found_clients']) == len(active_clients):
-            print(f"Все активные клиенты нашли игру, подтверждаем")
-            self._broadcast_to_session(session, "ACCEPT")
-            self._cleanup_game_timer(session)
-
-    def _handle_game_timeout(self, session):
-        """Обработка таймаута подтверждения игры"""
-        with self.lock:
-            if session not in self.game_timers:
-                return
-                
-            timer_data = self.game_timers[session]
-            session_data = self.sessions.get(session, {})
-            
-            print(f"Таймаут подтверждения игры для сессии {session}")
-            print(f"Нашли игру: {len(timer_data['found_clients'])}/{len(session_data)} клиентов")
-            
-            # Отправляем SKIP всем клиентам (даже неактивным)
-            for cid, client in session_data.items():
-                # Сбрасываем статус найденной игры
-                self.sessions[session][cid]['found'] = False
-                
-                if client['active']:
-                    try:
-                        print(f"Отправка SKIP клиенту {cid}")
-                        client['conn'].sendall(b"SKIP")
-                    except Exception as e:
-                        print(f"Ошибка отправки SKIP клиенту {cid}: {e}")
-                else:
-                    # Для неактивных сохраняем команду в ожидание
-                    self.sessions[session][cid]['pending_commands'].append("SKIP")
-                    print(f"SKIP сохранен для неактивного клиента {cid}")
-            
-            # Сбрасываем таймер
-            self._cleanup_game_timer(session)
-
-    def _broadcast_to_session(self, session, command):
-        """Отправляет команду всем клиентам в сессии"""
-        for cid, client_data in self.sessions[session].items():
-            if client_data['active']:
-                try:
-                    client_data['conn'].sendall(command.encode())
-                    print(f"Отправлено {command} клиенту {cid}")
-                except Exception as e:
-                    print(f"Ошибка отправки {command} клиенту {cid}: {e}")
-                    client_data['active'] = False
-            else:
-                # Сохраняем команду для неактивных клиентов
-                client_data['pending_commands'].append(command)
-                print(f"Команда {command} сохранена для неактивного клиента {cid}")
-
-    def _cleanup_game_timer(self, session):
-        """Очищает таймер игры"""
-        if session in self.game_timers:
-            try:
-                self.game_timers[session]['timer'].cancel()
-            except:
-                pass
-            del self.game_timers[session]
-
-    def _check_start_condition(self, session):
-        """Проверяет возможность начать поиск"""
-        if session not in self.sessions:
+            self.conn.sendall(f"{command}\n".encode())
+            return True
+        except:
             return False
-            
-        session_data = self.sessions[session]
-        active_clients = [c for c in session_data.values() if c['active'] and c['ready']]
-        return len(active_clients) >= self.min_clients
 
-    def _mark_inactive(self, cid, session_id):
-        """Помечает клиента как неактивного"""
+class SyncServer:
+    def __init__(self):
+        self.clients = {}
+        self.sessions = defaultdict(dict)
+        self.lock = threading.Lock()
+        self.timers = {}  # Таймеры для ожидания второго клиента
+        
+    def add_client(self, client):
         with self.lock:
-            if cid and session_id and session_id in self.sessions and cid in self.sessions[session_id]:
-                self.sessions[session_id][cid]['active'] = False
-                print(f"Клиент {cid} помечен как неактивный в сессии {session_id}")
+            self.clients[client.client_id] = client
+            if client.session_id == SESSION_ID:
+                self.sessions[SESSION_ID][client.client_id] = client
+    
+    def remove_client(self, client):
+        with self.lock:
+            if client.client_id in self.clients:
+                del self.clients[client.client_id]
+            if client.session_id == SESSION_ID and client.client_id in self.sessions[SESSION_ID]:
+                del self.sessions[SESSION_ID][client.client_id]
+                print(f"Клиент {client.client_id} удален из сессии")
                 
-            if cid in self.connections:
-                del self.connections[cid]
-
-    def start(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((self.host, self.port))
-            s.listen(10)
-            print(f"Сервер запущен на {self.host}:{self.port}")
-            
-            while self.running:
-                try:
-                    conn, addr = s.accept()
-                    threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
-                except Exception as e:
-                    if self.running:
-                        print(f"Ошибка подключения: {e}")
-
-    def stop(self):
-        self.running = False
+                # Отменяем таймер, если он был для этого клиента
+                if client.client_id in self.timers:
+                    self.timers[client.client_id].cancel()
+                    del self.timers[client.client_id]
+                
+                # Уведомляем оставшегося клиента о сбросе
+                for other in self.sessions[SESSION_ID].values():
+                    if other != client:
+                        other.send_command("RESET")
+    
+    def process_ready(self, client):
         with self.lock:
-            for conn in self.connections.values():
-                try:
-                    conn.close()
-                except:
-                    pass
-            self.connections.clear()
+            session_clients = list(self.sessions[SESSION_ID].values())
+            
+            # Проверяем, все ли клиенты готовы
+            all_ready = True
+            for c in session_clients:
+                if c.state != "ready":
+                    all_ready = False
+                    break
+            
+            if all_ready and len(session_clients) >= 2:
+                print("Все клиенты готовы, отправляем START")
+                for c in session_clients:
+                    c.state = "searching"
+                    c.search_status = "searching"
+                    c.send_command("START")
+    
+    def process_found(self, client):
+        with self.lock:
+            session_clients = list(self.sessions[SESSION_ID].values())
+            
+            # Если это первый клиент, который нашел игру
+            found_clients = [c for c in session_clients if c.state == "found"]
+            if len(found_clients) == 1:
+                print(f"[{client.client_id}] Первый нашел игру, запускаем таймер")
+                
+                # Запускаем таймер ожидания второго клиента
+                timer = threading.Timer(SYNC_TIMEOUT, self.handle_timeout, [client])
+                timer.start()
+                
+                # Сохраняем таймер
+                self.timers[client.client_id] = timer
+                
+            elif len(found_clients) >= 2:
+                # Если уже есть два клиента, которые нашли игру
+                print(f"[{client.client_id}] Второй нашел игру")
+                self.accept_game()
+    
+    def handle_timeout(self, first_client):
+        with self.lock:
+            print(f"Таймаут ожидания второго клиента для {first_client.client_id}")
+            
+            # Отправляем первому клиенту команду DECLINE
+            first_client.send_command("DECLINE")
+            first_client.state = "ready"
+            first_client.search_status = "idle"
+            
+            # Удаляем таймер
+            if first_client.client_id in self.timers:
+                del self.timers[first_client.client_id]
+    
+    def accept_game(self):
+        print("Оба клиента нашли игру, принимаем")
+        session_clients = list(self.sessions[SESSION_ID].values())
+        for client in session_clients:
+            if client.state == "found":
+                client.send_command("ACCEPT")
+                client.state = "in_game"
+                client.search_status = "in_game"
+                
+                # Отменяем таймеры
+                if client.client_id in self.timers:
+                    self.timers[client.client_id].cancel()
+                    del self.timers[client.client_id]
+
+def start_server():
+    server = SyncServer()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((SERVER_IP, SERVER_PORT))
+    sock.listen(5)
+    print(f"Сервер синхронизации запущен на {SERVER_IP}:{SERVER_PORT}")
+    
+    try:
+        while True:
+            conn, addr = sock.accept()
+            conn.settimeout(30)
+            print(f"Новое подключение: {addr}")
+            ClientHandler(conn, addr, server)
+    except KeyboardInterrupt:
+        print("Остановка сервера")
+    finally:
+        sock.close()
 
 if __name__ == "__main__":
-    server = EnhancedSyncServer(min_clients=2)
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        server.stop()
-        print("\nСервер остановлен")
+    start_server()

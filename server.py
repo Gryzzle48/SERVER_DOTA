@@ -19,7 +19,6 @@ class ClientHandler:
         self.session_id = None
         self.state = "disconnected"
         self.search_status = "idle"
-        self.command_queue = queue.Queue()
         self.running = True
         self.thread = threading.Thread(target=self.handle_client)
         self.thread.daemon = True
@@ -33,7 +32,6 @@ class ClientHandler:
                     if not data:
                         break
                     
-                    # Обработка команд
                     parts = data.split(':')
                     cmd = parts[0]
                     
@@ -47,7 +45,6 @@ class ClientHandler:
                         if len(state_parts) > 1:
                             self.search_status = state_parts[1]
                             
-                        # Добавляем клиента в сессию
                         self.server.add_client(self)
                         print(f"[{self.client_id}] Зарегистрирован в сессии {self.session_id}")
                         self.conn.sendall(b"OK\n")
@@ -69,7 +66,6 @@ class ClientHandler:
                         self.conn.sendall(b"PONG\n")
                     
                     elif cmd == "RECONNECT":
-                        # Повторная регистрация
                         if len(parts) >= 4:
                             self.session_id = parts[1]
                             self.client_id = parts[2]
@@ -105,7 +101,7 @@ class SyncServer:
         self.clients = {}
         self.sessions = defaultdict(dict)
         self.lock = threading.Lock()
-        self.timers = {}  # Таймеры для ожидания второго клиента
+        self.timers = {}
         
     def add_client(self, client):
         with self.lock:
@@ -121,12 +117,10 @@ class SyncServer:
                 del self.sessions[SESSION_ID][client.client_id]
                 print(f"Клиент {client.client_id} удален из сессии")
                 
-                # Отменяем таймер, если он был для этого клиента
                 if client.client_id in self.timers:
                     self.timers[client.client_id].cancel()
                     del self.timers[client.client_id]
                 
-                # Уведомляем оставшегося клиента о сбросе
                 for other in self.sessions[SESSION_ID].values():
                     if other != client:
                         other.send_command("RESET")
@@ -134,17 +128,11 @@ class SyncServer:
     def process_ready(self, client):
         with self.lock:
             session_clients = list(self.sessions[SESSION_ID].values())
+            ready_clients = [c for c in session_clients if c.state == "ready"]
             
-            # Проверяем, все ли клиенты готовы
-            all_ready = True
-            for c in session_clients:
-                if c.state != "ready":
-                    all_ready = False
-                    break
-            
-            if all_ready and len(session_clients) >= 2:
-                print("Все клиенты готовы, отправляем START")
-                for c in session_clients:
+            if len(ready_clients) >= 2:
+                print(f"Достаточно клиентов готово ({len(ready_clients)}), отправляем START")
+                for c in ready_clients:
                     c.state = "searching"
                     c.search_status = "searching"
                     c.send_command("START")
@@ -152,34 +140,24 @@ class SyncServer:
     def process_found(self, client):
         with self.lock:
             session_clients = list(self.sessions[SESSION_ID].values())
-            
-            # Если это первый клиент, который нашел игру
             found_clients = [c for c in session_clients if c.state == "found"]
+            
             if len(found_clients) == 1:
                 print(f"[{client.client_id}] Первый нашел игру, запускаем таймер")
-                
-                # Запускаем таймер ожидания второго клиента
                 timer = threading.Timer(SYNC_TIMEOUT, self.handle_timeout, [client])
                 timer.start()
-                
-                # Сохраняем таймер
                 self.timers[client.client_id] = timer
-                
             elif len(found_clients) >= 2:
-                # Если уже есть два клиента, которые нашли игру
                 print(f"[{client.client_id}] Второй нашел игру")
                 self.accept_game()
     
     def handle_timeout(self, first_client):
         with self.lock:
             print(f"Таймаут ожидания второго клиента для {first_client.client_id}")
-            
-            # Отправляем первому клиенту команду DECLINE
             first_client.send_command("DECLINE")
             first_client.state = "ready"
             first_client.search_status = "idle"
             
-            # Удаляем таймер
             if first_client.client_id in self.timers:
                 del self.timers[first_client.client_id]
     
@@ -192,7 +170,6 @@ class SyncServer:
                 client.state = "in_game"
                 client.search_status = "in_game"
                 
-                # Отменяем таймеры
                 if client.client_id in self.timers:
                     self.timers[client.client_id].cancel()
                     del self.timers[client.client_id]

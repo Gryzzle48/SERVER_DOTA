@@ -51,10 +51,11 @@ class EnhancedSyncServer:
                     continue
                     
                 command, session, cid = parts[0], parts[1], parts[2]
+                state_str = parts[3] if len(parts) > 3 else ""
                 
                 with self.lock:
                     if command == "REGISTER":
-                        self._handle_register(conn, session, cid, addr)
+                        self._handle_register(conn, session, cid, addr, state_str)
                         client_id = cid
                         session_id = session
                         
@@ -65,7 +66,8 @@ class EnhancedSyncServer:
                         self._handle_found(session, cid)
                         
                     elif command == "RECONNECT":
-                        self._handle_reconnect(conn, session, cid, addr)
+                        state_str = parts[3] if len(parts) > 3 else ""
+                        self._handle_reconnect(conn, session, cid, addr, state_str)
                         
                     elif command == "PONG":
                         if session in self.sessions and cid in self.sessions[session]:
@@ -80,16 +82,28 @@ class EnhancedSyncServer:
         finally:
             self._mark_inactive(client_id, session_id)
 
-    def _handle_register(self, conn, session, cid, addr):
+    def _handle_register(self, conn, session, cid, addr, state_str=""):
         now = time.time()
+        client_state = "idle"
+        has_command = False
+        
+        # Парсим переданное состояние
+        if state_str:
+            parts = state_str.split(':')
+            if len(parts) >= 2:
+                client_state = parts[0]
+                has_command = bool(int(parts[1]))
+        
         # Если клиент уже существует, обновляем соединение
         if session in self.sessions and cid in self.sessions[session]:
             client_data = self.sessions[session][cid]
             client_data['conn'] = conn
             client_data['active'] = True
             client_data['last_seen'] = now
+            client_data['state'] = client_state
+            client_data['has_command'] = has_command
             self.connections[cid] = conn
-            print(f"Клиент {cid} перерегистрирован в сессии {session}")
+            print(f"Клиент {cid} перерегистрирован в сессии {session}. Состояние: {client_state}")
         else:
             # Новый клиент
             self.sessions[session][cid] = {
@@ -98,13 +112,25 @@ class EnhancedSyncServer:
                 'active': True,
                 'last_seen': now,
                 'conn': conn,
-                'pending_commands': []
+                'pending_commands': [],
+                'state': client_state,
+                'has_command': has_command
             }
             self.connections[cid] = conn
-            print(f"Клиент {cid} зарегистрирован в сессии {session}")
+            print(f"Клиент {cid} зарегистрирован в сессии {session}. Состояние: {client_state}")
 
         # Отправляем ожидающие команды
         self._send_pending_commands(session, cid)
+        
+        # Если клиент уже ищет игру, обновляем его состояние
+        if client_state == "searching":
+            self.sessions[session][cid]['ready'] = True
+            print(f"Клиент {cid} уже ищет игру, отмечаем как готового")
+        
+        # Если клиент уже нашел игру, обновляем его состояние
+        if client_state == "found":
+            self.sessions[session][cid]['found'] = True
+            print(f"Клиент {cid} уже нашел игру, отмечаем как найденного")
 
     def _handle_ready(self, session, cid):
         if session in self.sessions and cid in self.sessions[session]:
@@ -145,7 +171,7 @@ class EnhancedSyncServer:
             self.game_timers[session]['found_clients'].add(cid)
             self._check_game_confirmation(session)
 
-    def _handle_reconnect(self, conn, session, cid, addr):
+    def _handle_reconnect(self, conn, session, cid, addr, state_str=""):
         if session in self.sessions and cid in self.sessions[session]:
             client_data = self.sessions[session][cid]
             client_data['conn'] = conn
@@ -153,7 +179,14 @@ class EnhancedSyncServer:
             client_data['last_seen'] = time.time()
             self.connections[cid] = conn
             
-            print(f"Клиент {cid} переподключен")
+            # Обновляем состояние клиента
+            if state_str:
+                parts = state_str.split(':')
+                if len(parts) >= 2:
+                    client_data['state'] = parts[0]
+                    client_data['has_command'] = bool(int(parts[1]))
+            
+            print(f"Клиент {cid} переподключен. Состояние: {client_data['state']}")
             
             # Отправляем ожидающие команды
             self._send_pending_commands(session, cid)

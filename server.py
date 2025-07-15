@@ -70,7 +70,7 @@ class EnhancedSyncServer:
             'found': False,
             'active': True,
             'last_active': time.time(),
-            'conn': conn
+            'conn': conn  # Сохраняем соединение
         }
         self.connections[cid] = conn
         conn.sendall(b"ACK:REGISTER")
@@ -81,7 +81,11 @@ class EnhancedSyncServer:
         if session in self.sessions and cid in self.sessions[session]:
             self.sessions[session][cid]['ready'] = True
             self.sessions[session][cid]['last_active'] = time.time()
-            conn.sendall(b"ACK:READY")
+            
+            # Исправление: получаем соединение из данных клиента
+            client_conn = self.sessions[session][cid]['conn']
+            client_conn.sendall(b"ACK:READY")
+            
             print(f"Клиент {cid} готов к поиску")
             
             # Проверка возможности начала поиска

@@ -185,6 +185,9 @@ func handleReady(client *Client, sessionID string) {
 			readyClients[i].InSearch = true
 			if !sendResponse(readyClients[i].Conn, "START_SEARCH") {
 				fmt.Printf("Ошибка отправки START_SEARCH клиенту %s\n", readyClients[i].ID)
+			} else {
+				// Успешная отправка - сбрасываем флаг готовности
+				readyClients[i].Ready = false
 			}
 			session.Mutex.Unlock()
 		}

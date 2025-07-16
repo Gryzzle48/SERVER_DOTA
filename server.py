@@ -23,7 +23,6 @@ class ClientHandler:
         self.thread.start()
         
     def handle_client(self):
-        """Улучшенный обработчик клиента"""
         try:
             while self.running:
                 try:
@@ -52,8 +51,7 @@ class ClientHandler:
                             print(f"[{self.client_id}] Отправлен READY")
                             self.state = "ready"
                             self.server.process_ready(self)
-                            # Улучшенная отправка подтверждения
-                            self.conn.sendall(b"ACK:READY\n")
+                            # Убрали отправку ACK:READY
                     
                     elif cmd == "FOUND":
                         if self.session_id and self.client_id:
@@ -61,7 +59,6 @@ class ClientHandler:
                             self.state = "found"
                             self.search_status = "found"
                             self.server.process_found(self)
-                            self.conn.sendall(b"ACK:FOUND\n")
                     
                     elif cmd == "PING":
                         self.conn.sendall(b"PONG\n")
@@ -82,8 +79,8 @@ class ClientHandler:
                         print(f"Неизвестная команда: {data}")
                         self.conn.sendall(b"UNKNOWN\n")
                 except socket.timeout:
-                    # Отправляем пинг для поддержания соединения
-                    self.conn.sendall(b"PING\n")
+                    # Убрали отправку PING
+                    pass
                 except Exception as e:
                     print(f"Ошибка обработки команды: {e}")
         except Exception as e:
@@ -152,11 +149,14 @@ class SyncServer:
             session_clients = list(self.sessions[SESSION_ID].values())
             found_clients = [c for c in session_clients if c.state == "found"]
             
+            print(f"Найдено игр: {len(found_clients)}")
+            
             if len(found_clients) == 1:
                 print(f"[{client.client_id}] Первый нашел игру, запускаем таймер")
                 timer = threading.Timer(SYNC_TIMEOUT, self.handle_timeout, [client])
                 timer.start()
                 self.timers[client.client_id] = timer
+                
             elif len(found_clients) >= 2:
                 print(f"[{client.client_id}] Второй нашел игру")
                 self.accept_game()
@@ -164,12 +164,12 @@ class SyncServer:
     def handle_timeout(self, first_client):
         with self.lock:
             print(f"Таймаут ожидания второго клиента для {first_client.client_id}")
+            if first_client.client_id in self.timers:
+                del self.timers[first_client.client_id]
+            
             first_client.send_command("DECLINE")
             first_client.state = "ready"
             first_client.search_status = "idle"
-            
-            if first_client.client_id in self.timers:
-                del self.timers[first_client.client_id]
     
     def accept_game(self):
         print("Оба клиента нашли игру, принимаем")

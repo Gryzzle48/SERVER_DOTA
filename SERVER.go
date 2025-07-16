@@ -54,14 +54,15 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	// Установка таймаутов
-	conn.SetReadDeadline(time.Now().Add(300 * time.Second))
-	conn.SetWriteDeadline(time.Now().Add(300 * time.Second))
-	
-	client := &Client{
-		Conn: conn,
-	}
-
+    // Установка TCP keepalive
+    if tcpConn, ok := conn.(*net.TCPConn); ok {
+        tcpConn.SetKeepAlive(true)
+        tcpConn.SetKeepAlivePeriod(30 * time.Second)
+    }
+    
+    // Установка общих таймаутов
+    conn.SetReadDeadline(time.Now().Add(300 * time.Second))
+    conn.SetWriteDeadline(time.Now().Add(300 * time.Second))
 	// Обработка отключения клиента
 	defer func() {
 		if client.ID != "" {
@@ -256,11 +257,10 @@ func handleMatchTimeout(session *Session) {
 }
 
 func sendResponse(conn net.Conn, msg string) bool {
-    // Увеличиваем буфер записи
-    conn.SetWriteBuffer(1024 * 1024)  // 1 MB буфер
-    
-    // Добавляем повторные попытки
     for i := 0; i < 3; i++ {
+        // Устанавливаем таймаут для каждой попытки
+        conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+        
         _, err := fmt.Fprintln(conn, msg)
         if err == nil {
             return true
@@ -268,7 +268,7 @@ func sendResponse(conn net.Conn, msg string) bool {
         
         if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
             fmt.Printf("Таймаут отправки (попытка %d/3): %v\n", i+1, err)
-            time.Sleep(1 * time.Second)  // Пауза между попытками
+            time.Sleep(1 * time.Second)
             continue
         }
         

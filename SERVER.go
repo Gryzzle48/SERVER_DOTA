@@ -26,6 +26,7 @@ type Session struct {
 	MatchFound chan string
 	Timer      *time.Timer
 	Mutex      sync.Mutex
+	FoundCount int // ДОБАВЛЕНО НУЖНОЕ ПОЛЕ
 }
 
 var (
@@ -192,30 +193,20 @@ func handleFoundGame(client *Client, sessionID string) {
 }
 
 func handleMatchTimeout(session *Session) {
-	session.Mutex.Lock()
-	defer session.Mutex.Unlock()
+    session.Mutex.Lock()
+    defer session.Mutex.Unlock()
 
-	// Ищем клиента, который нашел игру
-	var foundClient *Client
-	for _, c := range session.Clients {
-		if c.Found {
-			foundClient = c
-			break
-		}
-	}
-
-	if foundClient != nil {
-		// Отправляем команду на отклонение
-		sendResponse(foundClient.Conn, "DECLINE_MATCH")
-		
-		// Сбрасываем состояние
-		foundClient.Found = false
-		foundClient.Ready = true
-		foundClient.InSearch = false
-	}
-
-	// Сбрасываем таймер
-	session.Timer = nil
+    // Отклоняем игру у всех клиентов, которые нашли игру
+    for _, c := range session.Clients {
+        if c.Found {
+            sendResponse(c.Conn, "DECLINE_MATCH")
+            c.Found = false
+        }
+    }
+    
+    // Сбрасываем счетчик и таймер
+    session.FoundCount = 0
+    session.Timer = nil
 }
 
 func sendResponse(conn net.Conn, msg string) {

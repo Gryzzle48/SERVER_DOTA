@@ -55,8 +55,8 @@ func main() {
 
 func handleConnection(conn net.Conn) {
 	// Установка таймаутов
-	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-	conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(300 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(300 * time.Second))
 	
 	client := &Client{
 		Conn: conn,
@@ -256,14 +256,24 @@ func handleMatchTimeout(session *Session) {
 }
 
 func sendResponse(conn net.Conn, msg string) bool {
-	_, err := fmt.Fprintln(conn, msg)
-	if err != nil {
-		if opErr, ok := err.(*net.OpError); ok {
-			fmt.Printf("Сетевая ошибка: %v\n", opErr)
-		} else {
-			fmt.Printf("Ошибка отправки '%s': %v\n", msg, err)
-		}
-		return false
-	}
-	return true
+    // Увеличиваем буфер записи
+    conn.SetWriteBuffer(1024 * 1024)  // 1 MB буфер
+    
+    // Добавляем повторные попытки
+    for i := 0; i < 3; i++ {
+        _, err := fmt.Fprintln(conn, msg)
+        if err == nil {
+            return true
+        }
+        
+        if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+            fmt.Printf("Таймаут отправки (попытка %d/3): %v\n", i+1, err)
+            time.Sleep(1 * time.Second)  // Пауза между попытками
+            continue
+        }
+        
+        fmt.Printf("Критическая ошибка отправки: %v\n", err)
+        return false
+    }
+    return false
 }

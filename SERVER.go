@@ -146,30 +146,49 @@ func handleReady(client *Client, sessionID string) {
 }
 
 func handleFoundGame(client *Client, sessionID string) {
-	sessionsMu.Lock()
-	session, exists := sessions[sessionID]
-	sessionsMu.Unlock()
+    sessionsMu.Lock()
+    session, exists := sessions[sessionID]
+    sessionsMu.Unlock()
 
-	if !exists {
-		sendResponse(client.Conn, "ERROR:NO_SESSION")
-		return
-	}
+    if !exists {
+        sendResponse(client.Conn, "ERROR:NO_SESSION")
+        return
+    }
 
-	session.Mutex.Lock()
-	client.Found = true
-	session.Mutex.Unlock()
+    session.Mutex.Lock()
+    defer session.Mutex.Unlock()
 
-	// Отправляем в канал уведомление о найденной игре
-	session.MatchFound <- client.ID
+    // Помечаем клиента как нашедшего игру
+    client.Found = true
+    
+    // Увеличиваем счетчик найденных игр в сессии
+    session.FoundCount++
 
-	// Обработка ожидания второго клиента
-	if session.Timer == nil {
-		session.Timer = time.NewTimer(5 * time.Second)
-		go func() {
-			<-session.Timer.C
-			handleMatchTimeout(session)
-		}()
-	}
+    // Если оба клиента нашли игру - принимаем
+    if session.FoundCount >= 2 {
+        for _, c := range session.Clients {
+            if c.Found {
+                sendResponse(c.Conn, "ACCEPT_MATCH")
+                // Сбрасываем статус
+                c.Found = false
+            }
+        }
+        // Сбрасываем счетчик
+        session.FoundCount = 0
+        
+        // Останавливаем и сбрасываем таймер если активен
+        if session.Timer != nil {
+            session.Timer.Stop()
+            session.Timer = nil
+        }
+    } else if session.Timer == nil {
+        // Запускаем таймер только для первого клиента
+        session.Timer = time.NewTimer(5 * time.Second)
+        go func() {
+            <-session.Timer.C
+            handleMatchTimeout(session)
+        }()
+    }
 }
 
 func handleMatchTimeout(session *Session) {

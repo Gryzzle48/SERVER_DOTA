@@ -4,12 +4,10 @@ import time
 import queue
 from collections import defaultdict
 
-# Конфигурация сервера
 SERVER_IP = '0.0.0.0'
 SERVER_PORT = 1234
 SESSION_ID = 'DOTA_BOTS'
-SYNC_TIMEOUT = 5  # 5 секунд ожидания второго клиента
-
+SYNC_TIMEOUT = 5
 class ClientHandler:
     def __init__(self, conn, addr, server):
         self.conn = conn
@@ -25,6 +23,7 @@ class ClientHandler:
         self.thread.start()
         
     def handle_client(self):
+        """Улучшенный обработчик клиента"""
         try:
             while self.running:
                 try:
@@ -34,7 +33,6 @@ class ClientHandler:
                     
                     parts = data.split(':')
                     cmd = parts[0]
-                    
                     if cmd == "REGISTER":
                         if len(parts) < 4:
                             continue
@@ -51,16 +49,19 @@ class ClientHandler:
                     
                     elif cmd == "READY":
                         if self.session_id and self.client_id:
+                            print(f"[{self.client_id}] Отправлен READY")
                             self.state = "ready"
                             self.server.process_ready(self)
-                            self.conn.sendall(b"ACK\n")
+                            # Улучшенная отправка подтверждения
+                            self.conn.sendall(b"ACK:READY\n")
                     
                     elif cmd == "FOUND":
                         if self.session_id and self.client_id:
+                            print(f"[{self.client_id}] Отправлен FOUND")
                             self.state = "found"
                             self.search_status = "found"
                             self.server.process_found(self)
-                            self.conn.sendall(b"ACK\n")
+                            self.conn.sendall(b"ACK:FOUND\n")
                     
                     elif cmd == "PING":
                         self.conn.sendall(b"PONG\n")
@@ -81,13 +82,19 @@ class ClientHandler:
                         print(f"Неизвестная команда: {data}")
                         self.conn.sendall(b"UNKNOWN\n")
                 except socket.timeout:
-                    continue
+                    # Отправляем пинг для поддержания соединения
+                    self.conn.sendall(b"PING\n")
+                except Exception as e:
+                    print(f"Ошибка обработки команды: {e}")
         except Exception as e:
             print(f"Ошибка обработки клиента: {e}")
         finally:
             self.running = False
             self.server.remove_client(self)
-            self.conn.close()
+            try:
+                self.conn.close()
+            except:
+                pass
     
     def send_command(self, command):
         try:
@@ -126,9 +133,12 @@ class SyncServer:
                         other.send_command("RESET")
     
     def process_ready(self, client):
+        """Улучшенная обработка готовности"""
         with self.lock:
             session_clients = list(self.sessions[SESSION_ID].values())
             ready_clients = [c for c in session_clients if c.state == "ready"]
+            
+            print(f"Готовых клиентов: {len(ready_clients)}")
             
             if len(ready_clients) >= 2:
                 print(f"Достаточно клиентов готово ({len(ready_clients)}), отправляем START")
@@ -175,23 +185,37 @@ class SyncServer:
                     del self.timers[client.client_id]
 
 def start_server():
+    """Запуск сервера с улучшенной обработкой ошибок"""
     server = SyncServer()
+    
+    # Настройка сокета с повторным использованием адреса
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((SERVER_IP, SERVER_PORT))
-    sock.listen(5)
-    print(f"Сервер синхронизации запущен на {SERVER_IP}:{SERVER_PORT}")
     
     try:
+        sock.bind((SERVER_IP, SERVER_PORT))
+        sock.listen(5)
+        print(f"Сервер синхронизации запущен на {SERVER_IP}:{SERVER_PORT}")
+        sock.settimeout(5)  # Таймаут для accept
+        
         while True:
-            conn, addr = sock.accept()
-            conn.settimeout(30)
-            print(f"Новое подключение: {addr}")
-            ClientHandler(conn, addr, server)
-    except KeyboardInterrupt:
-        print("Остановка сервера")
+            try:
+                conn, addr = sock.accept()
+                conn.settimeout(30)
+                print(f"Новое подключение: {addr}")
+                ClientHandler(conn, addr, server)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"Ошибка приема подключения: {e}")
+    except Exception as e:
+        print(f"Критическая ошибка сервера: {e}")
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except:
+            pass
+        print("Сервер остановлен")
 
 if __name__ == "__main__":
     start_server()

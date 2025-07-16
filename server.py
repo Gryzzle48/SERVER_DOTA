@@ -51,7 +51,6 @@ class ClientHandler:
                             print(f"[{self.client_id}] Отправлен READY")
                             self.state = "ready"
                             self.server.process_ready(self)
-                            # Убрали отправку ACK:READY
                     
                     elif cmd == "FOUND":
                         if self.session_id and self.client_id:
@@ -153,6 +152,8 @@ class SyncServer:
             
             if len(found_clients) == 1:
                 print(f"[{client.client_id}] Первый нашел игру, запускаем таймер")
+                # Сохраняем время обнаружения
+                client.found_time = time.time()
                 timer = threading.Timer(SYNC_TIMEOUT, self.handle_timeout, [client])
                 timer.start()
                 self.timers[client.client_id] = timer
@@ -176,9 +177,11 @@ class SyncServer:
         session_clients = list(self.sessions[SESSION_ID].values())
         for client in session_clients:
             if client.state == "found":
-                client.send_command("ACCEPT")
-                client.state = "in_game"
-                client.search_status = "in_game"
+                # Отправляем ACCEPT только если игра найдена недавно
+                if hasattr(client, 'found_time') and time.time() - client.found_time < SYNC_TIMEOUT + 5:
+                    client.send_command("ACCEPT")
+                    client.state = "in_game"
+                    client.search_status = "in_game"
                 
                 if client.client_id in self.timers:
                     self.timers[client.client_id].cancel()

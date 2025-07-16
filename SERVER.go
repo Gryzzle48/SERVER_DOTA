@@ -26,7 +26,7 @@ type Session struct {
 	MatchFound chan string
 	Timer      *time.Timer
 	Mutex      sync.Mutex
-	FoundCount int // ДОБАВЛЕНО НУЖНОЕ ПОЛЕ
+	FoundCount int
 }
 
 var (
@@ -54,14 +54,28 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
-
+	// Установка таймаутов
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+	
 	client := &Client{
 		Conn: conn,
 	}
 
+	// Обработка отключения клиента
+	defer func() {
+		if client.ID != "" {
+			fmt.Printf("Клиент %s отключен\n", client.ID)
+			removeClientFromSession(client.ID)
+		}
+		conn.Close()
+	}()
+
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
+		// Сброс таймаута при получении данных
+		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		
 		msg := scanner.Text()
 		parts := strings.Split(msg, ":")
 		if len(parts) < 3 {
@@ -85,7 +99,31 @@ func handleConnection(conn net.Conn) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Println("Ошибка чтения:", err)
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			fmt.Println("Таймаут чтения:", err)
+		} else {
+			fmt.Println("Ошибка чтения:", err)
+		}
+	}
+}
+
+func removeClientFromSession(clientID string) {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	
+	for sessionID, session := range sessions {
+		session.Mutex.Lock()
+		if _, exists := session.Clients[clientID]; exists {
+			delete(session.Clients, clientID)
+			fmt.Printf("Клиент %s удален из сессии %s\n", clientID, sessionID)
+			
+			// Удаляем сессию если она пуста
+			if len(session.Clients) == 0 {
+				delete(sessions, sessionID)
+				fmt.Printf("Сессия %s удалена\n", sessionID)
+			}
+		}
+		session.Mutex.Unlock()
 	}
 }
 
@@ -138,7 +176,9 @@ func handleReady(client *Client, sessionID string) {
 		for i := 0; i < 2; i++ {
 			session.Mutex.Lock()
 			readyClients[i].InSearch = true
-			sendResponse(readyClients[i].Conn, "START_SEARCH")
+			if !sendResponse(readyClients[i].Conn, "START_SEARCH") {
+				fmt.Printf("Ошибка отправки START_SEARCH клиенту %s\n", readyClients[i].ID)
+			}
 			session.Mutex.Unlock()
 		}
 	} else {
@@ -147,71 +187,83 @@ func handleReady(client *Client, sessionID string) {
 }
 
 func handleFoundGame(client *Client, sessionID string) {
-    sessionsMu.Lock()
-    session, exists := sessions[sessionID]
-    sessionsMu.Unlock()
+	sessionsMu.Lock()
+	session, exists := sessions[sessionID]
+	sessionsMu.Unlock()
 
-    if !exists {
-        sendResponse(client.Conn, "ERROR:NO_SESSION")
-        return
-    }
+	if !exists {
+		sendResponse(client.Conn, "ERROR:NO_SESSION")
+		return
+	}
 
-    session.Mutex.Lock()
-    defer session.Mutex.Unlock()
+	session.Mutex.Lock()
+	defer session.Mutex.Unlock()
 
-    // Помечаем клиента как нашедшего игру
-    client.Found = true
-    
-    // Увеличиваем счетчик найденных игр в сессии
-    session.FoundCount++
+	// Помечаем клиента как нашедшего игру
+	client.Found = true
+	
+	// Увеличиваем счетчик найденных игр в сессии
+	session.FoundCount++
 
-    // Если оба клиента нашли игру - принимаем
-    if session.FoundCount >= 2 {
-        for _, c := range session.Clients {
-            if c.Found {
-                sendResponse(c.Conn, "ACCEPT_MATCH")
-                // Сбрасываем статус
-                c.Found = false
-            }
-        }
-        // Сбрасываем счетчик
-        session.FoundCount = 0
-        
-        // Останавливаем и сбрасываем таймер если активен
-        if session.Timer != nil {
-            session.Timer.Stop()
-            session.Timer = nil
-        }
-    } else if session.Timer == nil {
-        // Запускаем таймер только для первого клиента
-        session.Timer = time.NewTimer(5 * time.Second)
-        go func() {
-            <-session.Timer.C
-            handleMatchTimeout(session)
-        }()
-    }
+	// Если оба клиента нашли игру - принимаем
+	if session.FoundCount >= 2 {
+		for _, c := range session.Clients {
+			if c.Found {
+				if !sendResponse(c.Conn, "ACCEPT_MATCH") {
+					fmt.Printf("Ошибка отправки ACCEPT_MATCH клиенту %s\n", c.ID)
+				}
+				// Сбрасываем статус
+				c.Found = false
+			}
+		}
+		// Сбрасываем счетчик
+		session.FoundCount = 0
+		
+		// Останавливаем и сбрасываем таймер если активен
+		if session.Timer != nil {
+			if !session.Timer.Stop() {
+				<-session.Timer.C
+			}
+			session.Timer = nil
+		}
+	} else if session.Timer == nil {
+		// Запускаем таймер только для первого клиента
+		session.Timer = time.NewTimer(5 * time.Second)
+		go func() {
+			<-session.Timer.C
+			handleMatchTimeout(session)
+		}()
+	}
 }
 
 func handleMatchTimeout(session *Session) {
-    session.Mutex.Lock()
-    defer session.Mutex.Unlock()
+	session.Mutex.Lock()
+	defer session.Mutex.Unlock()
 
-    // Отклоняем игру у всех клиентов, которые нашли игру
-    for _, c := range session.Clients {
-        if c.Found {
-            sendResponse(c.Conn, "DECLINE_MATCH")
-            c.Found = false
-        }
-    }
-    
-    // Сбрасываем счетчик и таймер
-    session.FoundCount = 0
-    session.Timer = nil
+	// Отклоняем игру у всех клиентов, которые нашли игру
+	for _, c := range session.Clients {
+		if c.Found {
+			if !sendResponse(c.Conn, "DECLINE_MATCH") {
+				fmt.Printf("Ошибка отправки DECLINE_MATCH клиенту %s\n", c.ID)
+			}
+			c.Found = false
+		}
+	}
+	
+	// Сбрасываем счетчик и таймер
+	session.FoundCount = 0
+	session.Timer = nil
 }
 
-func sendResponse(conn net.Conn, msg string) {
+func sendResponse(conn net.Conn, msg string) bool {
 	_, err := fmt.Fprintln(conn, msg)
 	if err != nil {
-		fmt.Println("Ошибка отправки:", err)
+		if opErr, ok := err.(*net.OpError); ok {
+			fmt.Printf("Сетевая ошибка: %v\n", opErr)
+		} else {
+			fmt.Printf("Ошибка отправки '%s': %v\n", msg, err)
+		}
+		return false
 	}
+	return true
 }

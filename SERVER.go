@@ -54,15 +54,21 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-    // Установка TCP keepalive
-    if tcpConn, ok := conn.(*net.TCPConn); ok {
-        tcpConn.SetKeepAlive(true)
-        tcpConn.SetKeepAlivePeriod(30 * time.Second)
-    }
-    
-    // Установка общих таймаутов
-    conn.SetReadDeadline(time.Now().Add(300 * time.Second))
-    conn.SetWriteDeadline(time.Now().Add(300 * time.Second))
+	// Установка таймаутов
+	conn.SetReadDeadline(time.Now().Add(300 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(300 * time.Second))
+	
+	// Установка TCP keepalive
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+	
+	// Создаем клиентскую структуру
+	client := &Client{
+		Conn: conn,
+	}
+	
 	// Обработка отключения клиента
 	defer func() {
 		if client.ID != "" {
@@ -75,7 +81,7 @@ func handleConnection(conn net.Conn) {
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		// Сброс таймаута при получении данных
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(300 * time.Second))
 		
 		msg := scanner.Text()
 		parts := strings.Split(msg, ":")
@@ -85,7 +91,7 @@ func handleConnection(conn net.Conn) {
 		}
 
 		cmd, sessionID, clientID := parts[0], parts[1], parts[2]
-		client.ID = clientID
+		client.ID = clientID  // Устанавливаем ID клиента
 
 		switch cmd {
 		case "REGISTER":
@@ -257,23 +263,24 @@ func handleMatchTimeout(session *Session) {
 }
 
 func sendResponse(conn net.Conn, msg string) bool {
-    for i := 0; i < 3; i++ {
-        // Устанавливаем таймаут для каждой попытки
-        conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-        
-        _, err := fmt.Fprintln(conn, msg)
-        if err == nil {
-            return true
-        }
-        
-        if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-            fmt.Printf("Таймаут отправки (попытка %d/3): %v\n", i+1, err)
-            time.Sleep(1 * time.Second)
-            continue
-        }
-        
-        fmt.Printf("Критическая ошибка отправки: %v\n", err)
-        return false
-    }
-    return false
+	for i := 0; i < 3; i++ {
+		// Устанавливаем таймаут для каждой попытки
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		
+		_, err := fmt.Fprintln(conn, msg)
+		if err == nil {
+			return true
+		}
+		
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			fmt.Printf("Таймаут отправки (попытка %d/3): %v\n", i+1, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		
+		fmt.Printf("Критическая ошибка отправки: %v\n", err)
+		return false
+	}
+	fmt.Println("Не удалось отправить сообщение после 3 попыток")
+	return false
 }
